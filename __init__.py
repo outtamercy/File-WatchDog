@@ -56,33 +56,25 @@ class RouteRow:
 
 class OrganizerPaths:
     def __init__(self, organizer):
-        self.organizer = organizer; self.config_path, self.root = self._resolve_instance(); config = configparser.ConfigParser(interpolation=None); config.read(self.config_path, encoding="utf-8"); general = config["General"] if config.has_section("General") else {}
-        if not general: raise RuntimeError(f"{self.config_path} has no [General] section. MO2 left us no map.")
-        self.mods = self._path(general.get("modsPath", "./mods")); self.overwrite = self._path(general.get("overwritePath", "overwrite")); self.profiles = self._path(general.get("profilesPath", "profiles")); self.profile_name = self._profile_name(general)
-        configured_game = self._managed_game_name() or self._decode(general.get("gameName", ""))
+        self.organizer = organizer
+        # Don't read the instance INI for runtime paths. Global installs and
+        # shared mod folders make that a stale map surprisingly often.
+        self.mods, self.overwrite, profile = (self._api_path("modsPath"), self._api_path("overwritePath"),
+                                              self._api_path("profilePath"))
+        game_root = self._managed_game_root()
+        missing = [label for label, value in (("mods", self.mods), ("Overwrite", self.overwrite),
+                                               ("active profile", profile), ("game root", game_root)) if value is None]
+        if missing:
+            raise RuntimeError("MO2 did not provide a live " + ", ".join(missing) +
+                               " path. Fix MO2 Settings > Paths; FW will not guess.")
+        invalid = [str(value) for value in (self.mods, self.overwrite, profile, game_root) if not value.is_dir()]
+        if invalid:
+            raise RuntimeError("MO2 handed FW a path that is missing: " + "; ".join(invalid) +
+                               ". Fix MO2 Settings > Paths; FW will not create a mystery folder.")
+        self.profiles, self.profile_name, self._game_root = profile.parent, profile.name, game_root
+        self.path_source = "MO2 API"
+        configured_game = self._managed_game_name() or "Unknown Game"
         self.game_name = "SkyrimSE" if configured_game == "Skyrim Special Edition" else configured_game
-    def _resolve_instance(self):
-        """Portable first, then MO2's selected global instance. No random-instance guessing."""
-        base = Path(self.organizer.basePath()).resolve(); portable = base / "ModOrganizer.ini"
-        if portable.is_file(): return portable, base
-        appdata = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local"))) / "ModOrganizer"; instances = appdata / "instances.ini"
-        parser = configparser.ConfigParser(interpolation=None)
-        if instances.is_file():
-            parser.read(instances, encoding="utf-8"); selected = self._decode(parser.get("General", "selected_instance", fallback=""))
-            section = next((name for name in parser.sections() if name.lower() == selected.lower()), None)
-            if selected:
-                config = appdata / selected / "ModOrganizer.ini"
-                if config.is_file():
-                    raw = self._decode(parser.get(section, "path", fallback="")) if section else ""; anchor = Path(raw) if raw else config.parent
-                    if raw and not anchor.is_absolute(): anchor = appdata / anchor
-                    return config, anchor.resolve()
-        flat = base.parent / "ModOrganizer.ini"
-        if flat.is_file(): return flat, flat.parent.resolve()
-        raise RuntimeError(f"MO2 config not found. Checked portable {portable} and the selected global instance in {instances}.")
-    def _decode(self, value):
-        value = str(value).strip()
-        if value.startswith("@ByteArray(") and value.endswith(")"): value = value[11:-1]
-        return value.replace("\\\\", "\\").strip().strip("\"'")
     def _managed_game_name(self):
         """MO2 knows which game this instance owns. Ask it before config spelunking."""
         try:
@@ -94,17 +86,22 @@ class OrganizerPaths:
         except Exception:
             pass
         return ""
-    def _path(self, value):
-        value = self._decode(value); path = Path(value) if value else self.root
-        return (path if path.is_absolute() else self.root / path).resolve()
-    def _profile_name(self, general):
-        saved = self._decode(general.get("selected_profile", ""))
+    def _api_path(self, method):
+        """Read one live MO2 path. No config fallback, no mystery guesses."""
         try:
-            runtime = self.organizer.profileName()
-            if runtime and (self.profiles / runtime).is_dir(): return runtime
-        except Exception: return saved or "Default"
-        if saved and (self.profiles / saved).is_dir(): return saved
-        return saved or "Default"
+            value = getattr(self.organizer, method)()
+            if hasattr(value, "absolutePath"): value = value.absolutePath()
+            value = str(value).strip()
+            return Path(value).resolve() if value else None
+        except Exception:
+            return None
+    def _managed_game_root(self):
+        try:
+            value = self.organizer.managedGame().gameDirectory()
+            if hasattr(value, "absolutePath"): value = value.absolutePath()
+            value = str(value).strip()
+            return Path(value).resolve() if value else None
+        except Exception: return None
     @property
     def profile_dir(self): return self.profiles / self.profile_name
     @property
@@ -128,15 +125,7 @@ class OrganizerPaths:
     def ui_settings_path(self): return self.data_dir / "ui_colors.json"
     @property
     def game_root(self):
-        """MO2 owns the game path. Config fallback is only for older API builds."""
-        try:
-            game = self.organizer.managedGame(); value = game.gameDirectory()
-            if hasattr(value, "absolutePath"): value = value.absolutePath()
-            if value: return Path(str(value)).resolve()
-        except Exception: pass
-        config = configparser.ConfigParser(interpolation=None); config.read(self.config_path, encoding="utf-8")
-        raw = self._decode(config.get("General", "gamePath", fallback=""))
-        return Path(raw).resolve() if raw else None
+        return self._game_root
     def game_executables(self):
         """Main game EXE first; extra root EXEs are only process guards."""
         root = self.game_root
@@ -741,7 +730,7 @@ class FileWatchdogWindow(QDialog):
             tabs.currentChanged.connect(lambda index: rootdna.activate() if index == rootdna_index else None)
         close = QPushButton("Close", self); close.clicked.connect(self.accept); layout.addWidget(close); self.refresh()
         self.color_scheme.currentTextChanged.connect(self._apply_color_scheme); self.color_scheme.setCurrentText(self._saved_color_scheme()); self._apply_color_scheme(self.color_scheme.currentText())
-        self._set_status(f"Using MO2 profile: {self.paths.profile_name}\nNo path guessing. These are the paths MO2 handed over.", (self.paths.config_path, self.paths.profile_dir, self.paths.mods, self.paths.overwrite))
+        self._set_status(f"Using MO2 profile: {self.paths.profile_name}\nPath source: {self.paths.path_source}. No path guessing; these are the live paths FW will use.", (self.paths.profile_dir, self.paths.mods, self.paths.overwrite, self.paths.game_root))
     def _saved_color_scheme(self):
         try:
             data = json.loads(self.paths.ui_settings_path.read_text(encoding="utf-8"))
@@ -849,9 +838,7 @@ class FileWatchdogWindow(QDialog):
                         messages.append(_make_route(self.paths, self.manifest, row)); self.changed = True
                     except Exception as exc:
                         logger.exception("Route action failed: %s", row.link); messages.append(f"Skipped {row.link}: {exc}")
-                # A half-clean Overwrite is how we got here. Once FW is asked to route
-                # output, it finishes the whole cleanup pass and preserves every path.
-                messages.append(_final_cleanup(self.paths, self.manifest)); self.changed = True
+                messages.append("Known route(s) linked. Everything else in Overwrite stayed put; use Clean OW only after you look it over.")
         except Exception as exc:
             logger.exception("Post-create Overwrite cleanup failed"); messages.append(f"FW stopped: {exc}")
         self.refresh(); self._set_status("\n\n".join(messages), [path for row in selected for path in (row.link, row.target)] + [self.paths.overwrite])
@@ -885,7 +872,7 @@ class FileWatchdogPlugin(mobase.IPluginTool):
     def name(self): return "FileWatchdog"
     def author(self): return "SkyGen"
     def description(self): return "Routes known generated output into dedicated File Watchdog mods."
-    def version(self): return mobase.VersionInfo("4.1.0", mobase.VersionScheme.DISCOVER)
+    def version(self): return mobase.VersionInfo("4.1.2", mobase.VersionScheme.DISCOVER)
     def isActive(self): return True
     def settings(self): return []
     def displayName(self): return "File Watchdog"
