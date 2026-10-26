@@ -13,6 +13,8 @@ from PyQt6.QtGui import QDesktopServices, QFont, QIcon
 from PyQt6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog, QHBoxLayout, QHeaderView, QLabel, QPushButton, QTableWidget, QTableWidgetItem, QTextBrowser, QTabWidget, QVBoxLayout, QWidget)
 
 PLUGIN_DIR = Path(__file__).parent
+ROOTDNA_MARKER = "root_dna.module.json"
+ROOTDNA_COUPLING = "rootdna_coupling.json"
 logger = logging.getLogger("FileWatchdog")
 if not logger.handlers:
     # Debug is a fresh-session receipt, not an archaeological dig.
@@ -24,12 +26,10 @@ if not logger.handlers:
 class OutputProfile:
     key: str; title: str; mod_name: str; routes: Tuple[str, ...]; name_hints: Tuple[str, ...]; dll_hints: Tuple[str, ...] = (); description: str = ""
 
-# Narrow on purpose. Generic textures/meshes routes are retired. The one
-# deliberate parent route is a dedicated, opt-in FW-owned SKSE runtime mod.
 OUTPUT_PROFILES = (
-    OutputProfile("skse_runtime", "Runtime staging — whole folder", "FileWatchdog - Runtime Staging Output", ("SKSE",), (), (), "MO2's live staging bucket. RDNA sorts it after the game is done."),
-    OutputProfile("project_legacy", "Project Legacy", "FileWatchdog - Project Legacy Output", ("SKSE/Plugins/ProjectLegacy",), ("project legacy", "projectlegacy"), ("ProjectLegacy*.dll",), "Project Legacy's own output. CharGen belongs to FAM, full stop."),
-    OutputProfile("fam_faces", "FAM Faces / CharGen", "FileWatchdog - FAM Faces Output", ("SKSE/Plugins/CharGen/Exported", "Textures/CharGen/Exported"), ("fam faces", "familiar faces", "chargen"), ("CharGen*.dll",), "CharGen exports, not somebody else's mod."),
+    OutputProfile("skse_runtime", "Runtime staging — whole folder", "FileWatchdog - Runtime Staging Output", ("SKSE",), (), (), "MO2's live staging bucket. FW sorts it after the game is done."),
+    OutputProfile("project_legacy", "Project Legacy", "FileWatchdog - Project Legacy Output", ("SKSE/Plugins/ProjectLegacy", "SKSE/Plugins/CharGen/Exported", "Textures/CharGen/Exported"), ("project legacy", "projectlegacy"), ("ProjectLegacy*.dll",), "Project Legacy's runtime data and CharGen exports. Existing FAM output stays untouched."),
+    OutputProfile("fam_faces", "FAM Faces / CharGen", "FileWatchdog - FAM Faces Output", (), ("fam faces", "familiar faces"), (), "Retired output route. Existing FAM output is retained; new CharGen exports belong to Project Legacy."),
     OutputProfile("community_shaders", "Community Shaders", "FileWatchdog - Community Shaders Output", ("SKSE/Plugins/CommunityShaders",), ("community shaders",), ("CommunityShaders*.dll",), "Shader settings and cache bits."),
     OutputProfile("faster_file_copy", "Faster File Copy", "FileWatchdog - Faster File Copy Cache", ("SKSE/Plugins/FasterFileCopy_cache",), ("faster file copy", "fasterfilecopy"), ("FasterFileCopy*.dll",), "The chunky copy cache."),
     OutputProfile("shader_cache", "Shader Cache", "FileWatchdog - Shader Cache", ("ShaderCache",), ("community shaders", "shader cache"), (), "Disposable shader cache."),
@@ -331,7 +331,6 @@ def _move_tree(source, target, skipped=()):
     """Move, never copy. Same-drive moves are renames; cross-drive is copy+delete."""
     for root, dirs, files in os.walk(source):
         base = Path(root)
-        for name in dirs: (target / base.relative_to(source) / name).mkdir(parents=True, exist_ok=True)
         for name in files:
             if base.relative_to(source).joinpath(name).as_posix() in skipped: continue
             item = base / name; destination = target / item.relative_to(source); destination.parent.mkdir(parents=True, exist_ok=True); shutil.move(str(item), str(destination))
@@ -340,9 +339,12 @@ def _move_tree(source, target, skipped=()):
     if remaining:
         raise RuntimeError(f"Move did not finish; {len(remaining)} source file(s) are still in {source}. Nothing gets called done until they're gone.")
 def _prune_empty_dirs(root):
+    removed = 0
     for folder in sorted((path for path in root.rglob("*") if path.is_dir()), key=lambda path: len(path.parts), reverse=True):
-        try: folder.rmdir()
+        try:
+            folder.rmdir(); removed += 1
         except OSError: pass
+    return removed
 def _prepare_fw_mod(paths, profile):
     """Give MO2 a proper mod receipt, then park all FW outputs at profile bottom."""
     (paths.mods / profile.mod_name).mkdir(parents=True, exist_ok=True)
@@ -365,6 +367,7 @@ def _migrate_runtime_staging_name(paths, manifest):
     for entry in manifest.history:
         if old_name in entry.get("target", ""): entry["target"] = entry["target"].replace(old_name, new_name); changed = True
     if changed: manifest.save()
+
 def _retire_obsolete_routes(paths, manifest):
     """Drop any old manifest route whose profile no longer owns that path."""
     retired = []
@@ -373,10 +376,21 @@ def _retire_obsolete_routes(paths, manifest):
         if not profile: continue
         row = RouteRow(route.profile, profile.title, Path(route.link), Path(route.target), "FW-owned", "retired", True)
         if _route_is_current(paths, row): continue
+        if _is_link(row.link):
+            if not _same_target(row.link, row.target):
+                raise RuntimeError(f"Retired route points somewhere unexpected: {row.link}")
+            row.link.rmdir()
         manifest.remove(row.link, "retired overlapping route")
         note = _remove_empty_fw_mod(paths, row, manifest)
         retired.append(f"Retired {row.title}.{note}")
     return retired
+def _prune_drained_overwrite_crumbs(paths, manifest):
+    for route in manifest.routes.values():
+        link, target = Path(route.link), Path(route.target)
+        if route.profile not in PROFILES_BY_KEY or not _route_is_current(paths, RouteRow(route.profile, "", link, target, "FW-owned", "", True)):
+            continue
+        if not target.exists() and link.is_dir() and not _has_files(link):
+            _prune_empty_dirs(link)
 def _prune_empty_fw_mods(paths, manifest):
     """Generic cleanup for empty FW-made mods. No profile-name special cases."""
     bound = {value for _key, value in _profile_ini(paths).items("custom_overwrites")}
@@ -392,6 +406,15 @@ def _prune_empty_fw_mods(paths, manifest):
             _prune_empty_dirs(root); meta.unlink(); root.rmdir(); removed.append(root.name)
         except OSError: pass
     if removed: _sync_fw_mods(paths)
+    return removed
+def _prune_empty_fw_output_dirs(paths):
+    removed = 0
+    for profile in OUTPUT_PROFILES:
+        root = paths.mods / profile.mod_name
+        meta = root / "meta.ini"
+        try: owned = "FW-owned generated runtime output" in meta.read_text(encoding="utf-8")
+        except OSError: owned = False
+        if owned: removed += _prune_empty_dirs(root)
     return removed
 def _move_remaining_overwrite(paths, manifest):
     """One explicit mop-up. Keep paths, leave Overwrite itself there and empty."""
@@ -448,6 +471,8 @@ def _process_runtime_staging(paths, manifest):
         manifest.note(other, staging_root, target, "moved unclassified runtime staging files")
         messages.append(f"Moved {len(leftovers)} unclassified file(s) to {target}.")
     _prune_empty_dirs(staging_root)
+    crumbs = _prune_empty_fw_output_dirs(paths)
+    if crumbs: messages.append(f"Removed {crumbs} empty File Watchdog folder(s).")
     return "\n\n".join(messages) if messages else "Runtime staging is empty. Good. It stays bound for the next game run."
 def _sync_fw_mods(paths):
     """Keep existing FW output mods in MO2's Output block without creating any."""
@@ -473,8 +498,8 @@ def _sync_fw_mods(paths):
     # Empty FW mods get deleted on restore. Their stale modlist entry goes too,
     # otherwise MO2 will keep showing a dead thing like a bad houseplant.
     kept = [line for line in lines if not (line[:1] in "+-" and line[1:].strip() in all_fw_names)]
-    # MO2 serializes the visual list backwards. The user's Output block is
-    # immediately after End of List in the file, as their profile proves.
+    # MO2 serializes the visual list backwards. FW-owned mods get re-inserted right
+    # after EOL, which is where the output block lives.
     boundary = next((index + 1 for index, line in enumerate(kept)
                      if line[1:].strip() == "End of List_separator"), 0)
     paths.modlist_path.write_text("\n".join(kept[:boundary] + fw_lines + kept[boundary:]) + "\n", encoding="utf-8")
@@ -509,8 +534,8 @@ def _fw_mutation(paths):
         os.close(handle)
         try: lock.unlink()
         except OSError: pass
-def _rootdna_panel(paths, parent):
-    """Find the separately shipped RootDNA by its marker, not its folder name."""
+def _rootdna_module_dir():
+    """Find separately shipped RootDNA by its marker, not its folder name."""
     plugin_root = PLUGIN_DIR.parent
     candidates = [plugin_root / "root_dna"]
     try:
@@ -520,17 +545,36 @@ def _rootdna_panel(paths, parent):
         logger.warning("Couldn't check for optional RootDNA: %s", exc); return None
     matches = []
     for module_dir in candidates:
-        marker_path = module_dir / "root_dna.module.json"
         try:
-            marker = json.loads(marker_path.read_text(encoding="utf-8"))
+            marker = json.loads((module_dir / ROOTDNA_MARKER).read_text(encoding="utf-8"))
             if marker.get("module") == "RootDNA" and marker.get("api") == 1:
-                matches.append((module_dir, marker))
+                matches.append(module_dir)
         except (OSError, ValueError, TypeError): pass
     if not matches: return None
     if len(matches) > 1:
-        logger.warning("More than one RootDNA install was found; using %s and ignoring the rest.", matches[0][0])
-    module_dir, marker = matches[0]
+        logger.warning("More than one RootDNA install was found; using %s and ignoring the rest.", matches[0])
+    return matches[0]
+
+
+def _rootdna_is_coupled(module_dir):
     try:
+        data = json.loads((module_dir / ROOTDNA_COUPLING).read_text(encoding="utf-8"))
+        return data.get("format") == 1 and data.get("coupled_with_file_watchdog") is True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def _set_rootdna_coupled(module_dir, coupled):
+    path = module_dir / ROOTDNA_COUPLING; temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps({"format": 1, "coupled_with_file_watchdog": bool(coupled)}, indent=2), encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def _rootdna_panel(paths, parent, module_dir):
+    """Load RootDNA only after a user explicitly couples the two tools."""
+    try:
+        marker = json.loads((module_dir / ROOTDNA_MARKER).read_text(encoding="utf-8"))
+        if marker.get("module") != "RootDNA" or marker.get("api") != 1: return None
         entry = (module_dir / marker["entry"]).resolve()
         if entry.parent != module_dir.resolve() or not entry.is_file(): return None
         spec = importlib.util.spec_from_file_location("file_watchdog_rootdna", entry)
@@ -642,15 +686,25 @@ def _restore(paths, row, manifest):
     elif row.legacy or row.target_type != "FW-owned":
         raise RuntimeError(f"{row.link} is not a verified FW-owned recovery route. Hands off.")
     if row.link.exists() and not row.link.is_dir(): raise RuntimeError(f"{row.link} is a file, not an Overwrite folder. Hands off.")
-    row.link.mkdir(parents=True, exist_ok=True)
     skipped = ("meta.ini",) if row.profile == "other_overwrite" else ()
-    _check_restore_collision(row.link, row.target, skipped)
-    _move_tree(row.target, row.link, skipped)
+    target_was_drained = not row.target.exists()
+    if target_was_drained:
+        if row.target.is_symlink():
+            raise RuntimeError(f"Target is an unexpected link: {row.target}")
+    elif not row.target.is_dir():
+        raise RuntimeError(f"Target is not a directory: {row.target}")
+    else:
+        row.link.mkdir(parents=True, exist_ok=True)
+        _check_restore_collision(row.link, row.target, skipped)
+        _move_tree(row.target, row.link, skipped)
+    if target_was_drained and row.link.is_dir():
+        _prune_empty_dirs(row.link)
     route = manifest.routes.get(str(row.link)); profile = PROFILES_BY_KEY.get(row.profile); mod_root = _fw_mod_root(row)
     executables = route.executables if route else (_runtime_executables(profile) if profile else ())
     if executables and mod_root: _clear_output_bindings(paths, executables, mod_root.name)
     if route: manifest.remove(row.link)
-    return f"Restored to Overwrite: {row.link}"
+    return (f"Released drained route: {row.link}" if target_was_drained
+            else f"Restored to Overwrite: {row.link}")
 def _fw_mod_root(row):
     profile = PROFILES_BY_KEY.get(row.profile)
     if not profile: return None
@@ -692,12 +746,20 @@ def _file_index(root, limit=500):
 
 class FileWatchdogWindow(QDialog):
     HEADERS = ("", "Tool / profile", "Overwrite route", "Target (full path)", "Target type", "Status")
-    def __init__(self, paths, manifest, parent=None):
-        super().__init__(parent); self.paths, self.manifest, self.rows, self.changed, self.status_events = paths, manifest, [], False, []; self.setWindowTitle("File Watchdog — Route Manager"); self.resize(1450, 840)
+    def __init__(self, paths, manifest, parent=None, embedded=False, allow_rootdna=True):
+        super().__init__(parent); self.paths, self.manifest, self.rows, self.changed, self.status_events = paths, manifest, [], False, []; self._embedded = embedded; self._allow_rootdna = allow_rootdna; self.setWindowTitle("File Watchdog — Route Manager"); self.resize(1450, 840)
+        if embedded: self.setWindowFlags(Qt.WindowType.Widget)
         layout = QVBoxLayout(self); tabs = QTabWidget(self); self.tabs = tabs
         tab_font = QFont(tabs.tabBar().font()); tab_font.setBold(True); tabs.tabBar().setFont(tab_font)
+        corner = QWidget(tabs); corner_layout = QHBoxLayout(corner); corner_layout.setContentsMargins(0, 0, 0, 0)
+        self.couple_rootdna = QCheckBox("Couple RootDNA", corner)
+        self._rootdna_dir = _rootdna_module_dir()
+        self.couple_rootdna.setEnabled(self._rootdna_dir is not None and allow_rootdna)
+        self.couple_rootdna.setToolTip("Show RootDNA as an extra File Watchdog tab. This does not merge, install, disable, or modify either tool." if allow_rootdna and self._rootdna_dir else ("This File Watchdog view is already embedded inside RootDNA." if not allow_rootdna else "RootDNA is not installed beside File Watchdog. Package Daddy can install it; FW will not go hunting for it."))
+        self.couple_rootdna.setChecked(bool(allow_rootdna and self._rootdna_dir and _rootdna_is_coupled(self._rootdna_dir)))
         self.color_scheme = QComboBox(tabs); self.color_scheme.addItems(("MO2 blue", "Neon green", "Ember", "Rainbow")); self.color_scheme.setToolTip("Accent colors only. MO2 keeps its actual theme.")
-        tabs.setCornerWidget(self.color_scheme, Qt.Corner.TopRightCorner)
+        corner_layout.addWidget(self.couple_rootdna); corner_layout.addWidget(QLabel("Color", corner)); corner_layout.addWidget(self.color_scheme)
+        tabs.setCornerWidget(corner, Qt.Corner.TopRightCorner)
         routes_page = QWidget(self); routes_layout = QVBoxLayout(routes_page); tabs.addTab(routes_page, "File Watchdog"); layout.addWidget(tabs)
         routes_layout.addWidget(QLabel("Known generated output only. Ordinary installed mods are not targets. Ever."))
         body = QHBoxLayout(); left = QVBoxLayout(); right = QVBoxLayout(); body.addLayout(left, 4); body.addLayout(right, 1); routes_layout.addLayout(body)
@@ -724,13 +786,42 @@ class FileWatchdogWindow(QDialog):
         right.addWidget(QLabel("Activity log — click a path to open it."))
         self.status = QTextBrowser(self); self.status.setOpenLinks(False); self.status.anchorClicked.connect(self._open_status_link); self.status.setPlaceholderText("Route activity and safety messages show here. No popup nonsense."); right.addWidget(self.status)
         clear_log = QPushButton("Clear log", self); clear_log.clicked.connect(self._clear_status); right.addWidget(clear_log)
-        rootdna = _rootdna_panel(paths, tabs)
-        if rootdna is not None:
-            rootdna_index = tabs.addTab(rootdna, "RootDNA")
-            tabs.currentChanged.connect(lambda index: rootdna.activate() if index == rootdna_index else None)
-        close = QPushButton("Close", self); close.clicked.connect(self.accept); layout.addWidget(close); self.refresh()
+        self.rootdna_panel = None; self.rootdna_index = -1
+        self.couple_rootdna.toggled.connect(self._toggle_rootdna_coupling)
+        if self.couple_rootdna.isChecked(): self._mount_rootdna()
+        if not embedded:
+            close = QPushButton("Close", self); close.clicked.connect(self.accept); layout.addWidget(close)
+        self.refresh()
         self.color_scheme.currentTextChanged.connect(self._apply_color_scheme); self.color_scheme.setCurrentText(self._saved_color_scheme()); self._apply_color_scheme(self.color_scheme.currentText())
         self._set_status(f"Using MO2 profile: {self.paths.profile_name}\nPath source: {self.paths.path_source}. No path guessing; these are the live paths FW will use.", (self.paths.profile_dir, self.paths.mods, self.paths.overwrite, self.paths.game_root))
+
+    def _mount_rootdna(self):
+        if self.rootdna_panel is not None or self._rootdna_dir is None: return
+        rootdna = _rootdna_panel(self.paths, self.tabs, self._rootdna_dir)
+        if rootdna is None:
+            self._set_status("RootDNA was found but its declared module could not be loaded. FW left it alone.")
+            return
+        self.rootdna_panel = rootdna; self.rootdna_index = self.tabs.addTab(rootdna, "RootDNA")
+        self.tabs.currentChanged.connect(lambda index: rootdna.activate() if index == self.rootdna_index else None)
+
+    def _unmount_rootdna(self):
+        if self.rootdna_panel is None: return
+        index = self.tabs.indexOf(self.rootdna_panel)
+        if index >= 0: self.tabs.removeTab(index)
+        self.rootdna_panel.deleteLater(); self.rootdna_panel = None; self.rootdna_index = -1
+
+    def _toggle_rootdna_coupling(self, coupled):
+        if self._rootdna_dir is None: return
+        try:
+            _set_rootdna_coupled(self._rootdna_dir, coupled)
+        except OSError as exc:
+            self._set_status(f"Couldn't save the RootDNA coupling choice: {exc}")
+            self.couple_rootdna.blockSignals(True); self.couple_rootdna.setChecked(not coupled); self.couple_rootdna.blockSignals(False)
+            return
+        if coupled:
+            self._mount_rootdna(); self._set_status("FW and RootDNA are coupled. RootDNA is available as a tab here; both tools remain separately installed.")
+        else:
+            self._unmount_rootdna(); self._set_status("FW and RootDNA are separate again. Nothing was uninstalled or changed outside this UI preference.")
     def _saved_color_scheme(self):
         try:
             data = json.loads(self.paths.ui_settings_path.read_text(encoding="utf-8"))
@@ -746,20 +837,27 @@ class FileWatchdogWindow(QDialog):
         }
         accent, text, hover = accents.get(name, accents["MO2 blue"])
         rainbow = "qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #ff5c7a, stop:.25 #ffcb4c, stop:.50 #68e788, stop:.75 #56b8ff, stop:1 #c877ff)"
-        tab_base = "background-color: #21162b; color: #b5a9c3; border: 2px solid #5c3978; border-top-color: #9b75bd; border-left-color: #8053a6; border-right-color: #321a47; border-bottom-color: #1d0d2a;"
+        tab_base = "background:qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #503565, stop:.10 #2b1d38, stop:1 #160d20); color:#b5a9c3; border:2px solid #5c3978; border-top-color:#b895d2; border-left-color:#8053a6; border-right-color:#321a47; border-bottom-color:#12081a;"
         if name == "Rainbow":
             selected = f"background: {rainbow}; color: #101018; border: 2px solid #ffffff; border-top-color: #ffffff; border-left-color: #ffe7fb; border-right-color: #a76bea; border-bottom-color: #633785;"
         else:
             selected = f"background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 {hover}, stop:0.48 #171d27, stop:1 #0e1118); color: {text}; border: 2px solid {accent}; border-top-color: {text}; border-left-color: {accent}; border-right-color: #241138; border-bottom-color: #160a22;"
         # Static bevel: visible at rest, brightened on hover. Rainbow stays
         # reserved for the active tab so the eye has one obvious landing spot.
-        button_base = "background-color: #21162b; color: #eee7f8; border: 2px solid #7e45ad; border-top-color: #d9afff; border-left-color: #bd83ea; border-right-color: #4b236e; border-bottom-color: #2a123e; padding: 3px 8px;"
+        button_base = "background:qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #62417d, stop:.08 #3c2850, stop:.48 #21162b, stop:1 #130b1b); color:#eee7f8; border:2px solid #7e45ad; border-top-color:#e7c9ff; border-left-color:#bd83ea; border-right-color:#4b236e; border-bottom-color:#160a22; padding:3px 8px;"
         hover_fill = f"background: {rainbow}; color: #101018;" if name == "Rainbow" else f"background: {hover}; color: {text};"
+        header_base = "background:qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #5a3a70, stop:.10 #352246, stop:.52 #21162b, stop:1 #120a19); color:#eee7f8; border:1px solid #7e45ad; padding:5px; font-weight:bold;"
+        header_hover = f"background:{rainbow}; color:#101018; border:1px solid #ffffff;" if name == "Rainbow" else f"background:{hover}; color:{text}; border:1px solid {accent};"
+        surface = "background:qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #342042, stop:.05 #281935, stop:.52 #21162b, stop:1 #160d20);"
         # Accent only. No padding, geometry, or full palette hijack—MO2 has
         # enough opinions already.
-        self.setStyleSheet(f"QTabBar::tab {{ {tab_base} }} QTabBar::tab:selected {{ {selected} }} "
-                           f"QPushButton {{ {button_base} }} QPushButton:hover {{ {hover_fill} }} "
+        self.setStyleSheet(f"QDialog {{ {surface} }} QTabWidget::pane {{ border:1px solid #704493; {surface} }} "
+                           f"QTableWidget {{ background:#21162b; color:#eee7f8; border:1px solid #704493; gridline-color:#4b2b61; }} "
+                           f"QTextBrowser,QComboBox {{ background:qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #2c1b38, stop:1 #160d20); border:1px solid #704493; }} "
+                           f"QTabBar::tab {{ {tab_base} }} QTabBar::tab:selected {{ {selected} }} "
+                           f"QPushButton {{ {button_base} }} QPushButton:checked {{ {hover_fill} }} QPushButton:hover {{ {hover_fill} }} "
                            "QPushButton:pressed { background-color: #100a16; border-top-color: #2a123e; border-left-color: #4b236e; border-right-color: #d9afff; border-bottom-color: #bd83ea; } "
+                           f"QHeaderView::section {{ {header_base} }} QHeaderView::section:hover {{ {header_hover} }} QTableCornerButton::section {{ {header_base} }} "
                            f"QCheckBox::indicator:checked {{ background: {accent}; border: 1px solid {text}; }}")
         try:
             self.paths.ui_settings_path.parent.mkdir(parents=True, exist_ok=True)
@@ -872,7 +970,7 @@ class FileWatchdogPlugin(mobase.IPluginTool):
     def name(self): return "FileWatchdog"
     def author(self): return "SkyGen"
     def description(self): return "Routes known generated output into dedicated File Watchdog mods."
-    def version(self): return mobase.VersionInfo("4.1.2", mobase.VersionScheme.DISCOVER)
+    def version(self): return mobase.VersionInfo("4.1.3", mobase.VersionScheme.DISCOVER)
     def isActive(self): return True
     def settings(self): return []
     def displayName(self): return "File Watchdog"
@@ -884,9 +982,13 @@ class FileWatchdogPlugin(mobase.IPluginTool):
             if self._organizer is None: raise RuntimeError("MO2 handed FW an empty leash somehow.")
             paths = OrganizerPaths(self._organizer); manifest = RouteManifest(paths.manifest_path, paths.game_identity())
             if manifest.conflict: raise RuntimeError(manifest.conflict)
-            _migrate_runtime_staging_name(paths, manifest); _retire_obsolete_routes(paths, manifest); _prune_empty_fw_mods(paths, manifest); _sync_fw_mods(paths)
+            _migrate_runtime_staging_name(paths, manifest); _retire_obsolete_routes(paths, manifest); _prune_drained_overwrite_crumbs(paths, manifest); _prune_empty_fw_mods(paths, manifest); _prune_empty_fw_output_dirs(paths); _sync_fw_mods(paths)
             window = FileWatchdogWindow(paths, manifest); window.exec()
-            if window.changed: _refresh_mo2(paths)
+            # RootDNA owns its own filesystem operations, but MO2 still needs
+            # the same close-time refresh FW uses for created/removed output
+            # mods.  Otherwise a successful RootDNA deploy is invisible in
+            # the left pane until the user manually reloads MO2.
+            if window.changed or getattr(getattr(window, "rootdna_panel", None), "changed", False): _refresh_mo2(paths)
         except Exception as exc:
             logger.exception("FW window failed: %s", exc)
 def createPlugin(): return FileWatchdogPlugin()
