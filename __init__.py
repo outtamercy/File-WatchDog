@@ -1,6 +1,6 @@
 """File Watchdog: narrow, inspectable routes for known generated output."""
 from __future__ import annotations
-import configparser, ctypes, html, importlib.util, json, logging, os, re, shutil, subprocess
+import configparser, ctypes, filecmp, html, importlib.util, json, logging, os, re, shutil, subprocess
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from urllib.parse import quote
@@ -28,7 +28,7 @@ class OutputProfile:
 
 OUTPUT_PROFILES = (
     OutputProfile("skse_runtime", "Runtime staging — whole folder", "FileWatchdog - Runtime Staging Output", ("SKSE",), (), (), "MO2's live staging bucket. FW sorts it after the game is done."),
-    OutputProfile("project_legacy", "Project Legacy", "FileWatchdog - Project Legacy Output", ("SKSE/Plugins/ProjectLegacy", "SKSE/Plugins/CharGen/Exported", "Textures/CharGen/Exported"), ("project legacy", "projectlegacy"), ("ProjectLegacy*.dll",), "Project Legacy's runtime data and CharGen exports. Existing FAM output stays untouched."),
+    OutputProfile("project_legacy", "Project Legacy", "FileWatchdog - Project Legacy Output", ("SKSE/Plugins/ProjectLegacy", "SKSE/Plugins/ProjectLegacy.log", "SKSE/Plugins/CharGen/Exported", "SKSE/Plugins/CharGen/Presets", "Textures/CharGen/Exported"), ("project legacy", "projectlegacy"), ("ProjectLegacy*.dll",), "Project Legacy's runtime data and CharGen exports. Existing FAM output stays untouched."),
     OutputProfile("fam_faces", "FAM Faces / CharGen", "FileWatchdog - FAM Faces Output", (), ("fam faces", "familiar faces"), (), "Retired output route. Existing FAM output is retained; new CharGen exports belong to Project Legacy."),
     OutputProfile("community_shaders", "Community Shaders", "FileWatchdog - Community Shaders Output", ("SKSE/Plugins/CommunityShaders",), ("community shaders",), ("CommunityShaders*.dll",), "Shader settings and cache bits."),
     OutputProfile("faster_file_copy", "Faster File Copy", "FileWatchdog - Faster File Copy Cache", ("SKSE/Plugins/FasterFileCopy_cache",), ("faster file copy", "fasterfilecopy"), ("FasterFileCopy*.dll",), "The chunky copy cache."),
@@ -124,6 +124,8 @@ class OrganizerPaths:
     @property
     def ui_settings_path(self): return self.data_dir / "ui_colors.json"
     @property
+    def output_layout_path(self): return self.data_dir / "output_layout.json"
+    @property
     def game_root(self):
         return self._game_root
     def game_executables(self):
@@ -144,6 +146,18 @@ class OrganizerPaths:
     def game_identity(self):
         root = self.game_root
         return {"name": self.game_name or (root.name if root else "unknown"), "root": str(root).lower() if root else ""}
+
+def _profile_mod_suffix(paths):
+    value = re.sub(r"[\\/:*?\"<>|]", "_", paths.profile_name).strip().rstrip(".")
+    return value or "Profile"
+def _uses_profile_output_names(paths):
+    try:
+        return json.loads(paths.output_layout_path.read_text(encoding="utf-8")).get("layout") == "profile"
+    except (OSError, ValueError, TypeError):
+        return not any((paths.mods / profile.mod_name).is_dir() for profile in OUTPUT_PROFILES)
+def _output_mod_name(paths, profile):
+    return f"{profile.mod_name} - {_profile_mod_suffix(paths)}" if _uses_profile_output_names(paths) else profile.mod_name
+def _output_mod_root(paths, profile): return paths.mods / _output_mod_name(paths, profile)
 
 class RouteManifest:
     def __init__(self, path, game_identity=None):
@@ -268,7 +282,7 @@ def _detected_profile_keys(paths):
             for name in active:
                 plugin_dir = paths.mods / name / "SKSE" / "Plugins"
                 if plugin_dir.is_dir() and any(any(plugin_dir.glob(hint)) for hint in profile.dll_hints): found = True; break
-        if not found: found = any((paths.overwrite / route).exists() for route in profile.routes)
+        if not found and profile.key != "project_legacy": found = any((paths.overwrite / route).exists() for route in profile.routes)
         if found: detected.append(profile.key)
     paths.cache_path.parent.mkdir(parents=True, exist_ok=True); paths.cache_path.write_text(json.dumps({"fingerprint": fingerprint, "profiles": detected}), encoding="utf-8")
     return detected
@@ -307,13 +321,18 @@ def _build_rows(paths, manifest):
             if key not in rows:
                 # MO2 exposes a mod's root as Data. Keep SKSE routes as
                 # <FW mod>\SKSE\Plugins\..., never as a made-up folder name.
-                target = paths.mods / profile.mod_name / route
+                target = _output_mod_root(paths, profile) / route
                 rows[key] = RouteRow(profile.key, profile.title, link, target, "FW-owned", _row_status(paths, link, target, False, _runtime_executables(profile)))
     # The catch-all preserves Overwrite's relative paths at the mod root, so it
     # has no normal child route to discover. Give it a real return row anyway.
-    other = PROFILES_BY_KEY["other_overwrite"]; other_root = paths.mods / other.mod_name
+    other = PROFILES_BY_KEY["other_overwrite"]; other_root = _output_mod_root(paths, other)
     if other_root.is_dir() and any(item.is_file() and item.name.lower() != "meta.ini" for item in other_root.rglob("*")):
         rows[(str(paths.overwrite), other.key)] = RouteRow(other.key, other.title, paths.overwrite, other_root, "FW-owned", "restore available", True)
+    staging = PROFILES_BY_KEY["skse_runtime"]
+    staging_root = _output_mod_root(paths, staging)
+    has_runtime_route = any(route.profile == staging.key for route in manifest.routes.values())
+    if not has_runtime_route and staging_root.is_dir() and any(item.is_file() and item.name.lower() != "meta.ini" for item in staging_root.rglob("*")):
+        rows[(str(paths.overwrite), "runtime_staging_recovery")] = RouteRow("other_overwrite", "Runtime staging recovery", paths.overwrite, staging_root, "FW-owned", "restore available", True)
     for link in _legacy_links(paths.overwrite, manifest):
         target = link.resolve(); kind = "legacy FW-owned mod" if target.name.lower().startswith("filewatchdog -") else "legacy normal mod"
         rows[(str(link), "legacy")] = RouteRow("legacy", "Legacy recovery", link, target, kind, "legacy linked", legacy=True)
@@ -321,12 +340,21 @@ def _build_rows(paths, manifest):
 
 def _check_restore_collision(link, target, skipped=()):
     if not target.is_dir(): raise RuntimeError(f"Target is missing: {target}")
+    duplicates, conflicts = [], []
     for root, _dirs, files in os.walk(target):
         base = Path(root)
         for name in files:
-            if base.relative_to(target).joinpath(name).as_posix() in skipped: continue
-            destination = link / base.relative_to(target) / name
-            if destination.exists(): raise RuntimeError(f"Won't overwrite an Overwrite file: {destination}")
+            relative = base.relative_to(target).joinpath(name).as_posix()
+            if relative in skipped: continue
+            source, destination = base / name, link / base.relative_to(target) / name
+            if not destination.exists(): continue
+            if destination.is_file() and filecmp.cmp(source, destination, shallow=False):
+                duplicates.append(relative)
+            else:
+                conflicts.append(destination)
+    if conflicts:
+        raise RuntimeError(f"Won't overwrite {len(conflicts)} different Overwrite file(s). First: {conflicts[0]}")
+    return tuple(duplicates)
 def _move_tree(source, target, skipped=()):
     """Move, never copy. Same-drive moves are renames; cross-drive is copy+delete."""
     for root, dirs, files in os.walk(source):
@@ -347,11 +375,11 @@ def _prune_empty_dirs(root):
     return removed
 def _prepare_fw_mod(paths, profile):
     """Give MO2 a proper mod receipt, then park all FW outputs at profile bottom."""
-    (paths.mods / profile.mod_name).mkdir(parents=True, exist_ok=True)
+    _output_mod_root(paths, profile).mkdir(parents=True, exist_ok=True)
     _sync_fw_mods(paths)
 def _migrate_runtime_staging_name(paths, manifest):
     """One-time rename. Same files, same mapping, less misleading name."""
-    old_name = "FileWatchdog - SKSE Runtime Output"; new_name = PROFILES_BY_KEY["skse_runtime"].mod_name
+    old_name = "FileWatchdog - SKSE Runtime Output"; new_name = _output_mod_name(paths, PROFILES_BY_KEY["skse_runtime"])
     old_root, new_root = paths.mods / old_name, paths.mods / new_name
     if old_root.is_dir() and not new_root.exists(): shutil.move(str(old_root), str(new_root))
     _replace_output_binding(paths, old_name, new_name)
@@ -367,6 +395,72 @@ def _migrate_runtime_staging_name(paths, manifest):
     for entry in manifest.history:
         if old_name in entry.get("target", ""): entry["target"] = entry["target"].replace(old_name, new_name); changed = True
     if changed: manifest.save()
+
+def _profiles_using_mod(paths, mod_name):
+    users = set()
+    try: profile_dirs = [item for item in paths.profiles.iterdir() if item.is_dir()]
+    except OSError: return users
+    for profile_dir in profile_dirs:
+        modlist = profile_dir / "modlist.txt"
+        try:
+            if any(line[1:].strip() == mod_name for line in modlist.read_text(encoding="utf-8").splitlines() if line[:1] in "+-"):
+                users.add(profile_dir.name); continue
+        except OSError: pass
+        ini = configparser.ConfigParser(interpolation=None); ini.optionxform = str
+        try: ini.read(profile_dir / "settings.ini", encoding="utf-8")
+        except (OSError, configparser.Error): continue
+        if ini.has_section("custom_overwrites") and any(value == mod_name for _key, value in ini.items("custom_overwrites")):
+            users.add(profile_dir.name)
+    return users
+
+def _rename_modlist_entry(paths, old_name, new_name):
+    if not paths.modlist_path.is_file(): return
+    lines = paths.modlist_path.read_text(encoding="utf-8").splitlines()
+    paths.modlist_path.write_text("\n".join((line[:1] + new_name if line[:1] in "+-" and line[1:].strip() == old_name else line) for line in lines) + "\n", encoding="utf-8")
+
+def _make_outputs_profile_specific(paths, manifest):
+    if _uses_profile_output_names(paths): return "FW output mods already belong to this profile."
+    existing = [profile for profile in OUTPUT_PROFILES if (paths.mods / profile.mod_name).is_dir()]
+    foreign = sorted({profile_name for profile in existing for profile_name in _profiles_using_mod(paths, profile.mod_name) if profile_name != paths.profile_name}, key=str.lower)
+    if foreign:
+        raise RuntimeError("Shared FW output is still used by: " + ", ".join(foreign) + ". Nothing was changed.")
+    renames = [(paths.mods / profile.mod_name, paths.mods / f"{profile.mod_name} - {_profile_mod_suffix(paths)}") for profile in existing]
+    collisions = [new for _old, new in renames if new.exists()]
+    if collisions: raise RuntimeError("Profile-specific FW output already exists: " + ", ".join(str(item) for item in collisions))
+    moved = []
+    try:
+        for old, new in renames:
+            shutil.move(str(old), str(new)); moved.append((old, new))
+    except Exception:
+        for old, new in reversed(moved):
+            try: shutil.move(str(new), str(old))
+            except OSError: pass
+        raise
+    for profile in existing:
+        old_name, new_name = profile.mod_name, f"{profile.mod_name} - {_profile_mod_suffix(paths)}"
+        _rename_modlist_entry(paths, old_name, new_name)
+        _replace_output_binding(paths, old_name, new_name)
+        old_root, new_root = paths.mods / old_name, paths.mods / new_name
+        for route in manifest.routes.values():
+            target = Path(route.target)
+            try: route.target = str(new_root / target.relative_to(old_root))
+            except ValueError: pass
+        for entry in manifest.history:
+            target = Path(entry.get("target", ""))
+            try: entry["target"] = str(new_root / target.relative_to(old_root))
+            except ValueError: pass
+    paths.output_layout_path.parent.mkdir(parents=True, exist_ok=True)
+    paths.output_layout_path.write_text(json.dumps({"layout": "profile", "profile": paths.profile_name}, indent=2), encoding="utf-8")
+    manifest.save(); _sync_fw_mods(paths)
+    return f"FW output mods now belong to profile: {paths.profile_name}."
+
+def _update_output_layout(paths, manifest):
+    if _uses_profile_output_names(paths): return "FW output mods are already profile-specific."
+    existing = [profile for profile in OUTPUT_PROFILES if (paths.mods / profile.mod_name).is_dir()]
+    foreign = sorted({profile_name for profile in existing for profile_name in _profiles_using_mod(paths, profile.mod_name) if profile_name != paths.profile_name}, key=str.lower)
+    if foreign:
+        return "Legacy FW output remains shared with: " + ", ".join(foreign) + ". FW left it untouched."
+    return _make_outputs_profile_specific(paths, manifest)
 
 def _retire_obsolete_routes(paths, manifest):
     """Drop any old manifest route whose profile no longer owns that path."""
@@ -397,10 +491,10 @@ def _prune_empty_fw_mods(paths, manifest):
     active_roots = {str(root) for route in manifest.routes.values() if (root := _fw_mod_root(RouteRow(route.profile, "", Path(route.link), Path(route.target), "", "", True))) is not None}
     removed = []
     for profile in OUTPUT_PROFILES:
-        root = paths.mods / profile.mod_name; meta = root / "meta.ini"
+        root = _output_mod_root(paths, profile); meta = root / "meta.ini"
         try: owned = "FW-owned generated runtime output" in meta.read_text(encoding="utf-8")
         except OSError: owned = False
-        if not owned or profile.mod_name in bound or str(root) in active_roots: continue
+        if not owned or _output_mod_name(paths, profile) in bound or str(root) in active_roots: continue
         if any(item.is_file() and item.name.lower() != "meta.ini" for item in root.rglob("*")): continue
         try:
             _prune_empty_dirs(root); meta.unlink(); root.rmdir(); removed.append(root.name)
@@ -410,7 +504,7 @@ def _prune_empty_fw_mods(paths, manifest):
 def _prune_empty_fw_output_dirs(paths):
     removed = 0
     for profile in OUTPUT_PROFILES:
-        root = paths.mods / profile.mod_name
+        root = _output_mod_root(paths, profile)
         meta = root / "meta.ini"
         try: owned = "FW-owned generated runtime output" in meta.read_text(encoding="utf-8")
         except OSError: owned = False
@@ -418,7 +512,7 @@ def _prune_empty_fw_output_dirs(paths):
     return removed
 def _move_remaining_overwrite(paths, manifest):
     """One explicit mop-up. Keep paths, leave Overwrite itself there and empty."""
-    profile = PROFILES_BY_KEY["other_overwrite"]; target = paths.mods / profile.mod_name
+    profile = PROFILES_BY_KEY["other_overwrite"]; target = _output_mod_root(paths, profile)
     _prepare_fw_mod(paths, profile); target.mkdir(parents=True, exist_ok=True)
     files = [item for item in paths.overwrite.rglob("*") if item.is_file()]
     if not files:
@@ -429,6 +523,22 @@ def _move_remaining_overwrite(paths, manifest):
     return f"Moved {len(files)} remaining Overwrite file(s) to {target}. Overwrite is empty now."
 def _has_files(path):
     return path.is_dir() and any(item.is_file() for item in path.rglob("*"))
+def _move_declared_path(paths, profile, source, target):
+    _prepare_fw_mod(paths, profile)
+    if source.is_file():
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists():
+            if target.is_file() and filecmp.cmp(source, target, shallow=False):
+                source.unlink(); return 0
+            raise RuntimeError(f"Won't overwrite a different file: {target}")
+        shutil.move(str(source), str(target)); return 1
+    target.mkdir(parents=True, exist_ok=True)
+    duplicates = _check_restore_collision(target, source)
+    for relative in duplicates: (source / relative).unlink()
+    _prune_empty_dirs(source)
+    count = sum(1 for item in source.rglob("*") if item.is_file()) if source.is_dir() else 0
+    _move_tree(source, target)
+    return count
 def _final_cleanup(paths, manifest):
     """Post-game mop-up: known routes first, then one honest home for leftovers."""
     messages = []
@@ -444,25 +554,25 @@ def _final_cleanup(paths, manifest):
 def _process_runtime_staging(paths, manifest):
     """Post-game pass. Drain the MO2 bucket with moves, then keep it bound."""
     staging = PROFILES_BY_KEY["skse_runtime"]
-    staging_root = paths.mods / staging.mod_name
-    _prepare_fw_mod(paths, staging)
-    _set_output_bindings(paths, _runtime_executables(staging), staging.mod_name)
+    staging_root = _output_mod_root(paths, staging)
+    _set_output_bindings(paths, _runtime_executables(staging), _output_mod_name(paths, staging))
     messages = []; moved = 0
+    detected = set(_detected_profile_keys(paths))
+    logger.info(f"FW staging scan: profile={paths.profile_name}; root={staging_root}; detected={sorted(detected)}")
     for profile in OUTPUT_PROFILES:
         if profile.key in {"skse_runtime", "other_overwrite"}: continue
+        if profile.key == "project_legacy" and profile.key not in detected: continue
         for route in profile.routes:
             source = staging_root / route
-            if not _has_files(source): continue
-            target = paths.mods / profile.mod_name / route
-            _check_restore_collision(target, source)
-            _prepare_fw_mod(paths, profile); target.mkdir(parents=True, exist_ok=True)
-            count = sum(1 for item in source.rglob("*") if item.is_file())
-            _move_tree(source, target); moved += count
+            if profile.key == "project_legacy": logger.info(f"FW PL route: {source}; exists={source.exists()}; file={source.is_file()}; has_files={_has_files(source)}")
+            if not source.is_file() and not _has_files(source): continue
+            target = _output_mod_root(paths, profile) / route
+            count = _move_declared_path(paths, profile, source, target); moved += count
             manifest.note(profile, source, target, "moved out of runtime staging")
             messages.append(f"Moved {count} file(s): {source} -> {target}")
     leftovers = [item for item in staging_root.rglob("*") if item.is_file() and item.name.lower() != "meta.ini"]
     if leftovers:
-        other = PROFILES_BY_KEY["other_overwrite"]; target = paths.mods / other.mod_name
+        other = PROFILES_BY_KEY["other_overwrite"]; target = _output_mod_root(paths, other)
         # meta.ini is MO2's receipt for the staging bucket, not runtime output.
         # Check the real destination (not staging backwards like a dingus), then
         # leave that receipt behind while draining everything else.
@@ -471,14 +581,39 @@ def _process_runtime_staging(paths, manifest):
         manifest.note(other, staging_root, target, "moved unclassified runtime staging files")
         messages.append(f"Moved {len(leftovers)} unclassified file(s) to {target}.")
     _prune_empty_dirs(staging_root)
+    meta = staging_root / "meta.ini"
+    try:
+        if staging_root.is_dir() and not any(item.is_file() and item.name.lower() != "meta.ini" for item in staging_root.rglob("*")):
+            _prune_empty_dirs(staging_root)
+            if meta.is_file() and "FW-owned generated runtime output" in meta.read_text(encoding="utf-8"):
+                meta.unlink(); staging_root.rmdir()
+                messages.append("Removed the drained Runtime Staging folder.")
+    except OSError: pass
     crumbs = _prune_empty_fw_output_dirs(paths)
     if crumbs: messages.append(f"Removed {crumbs} empty File Watchdog folder(s).")
     return "\n\n".join(messages) if messages else "Runtime staging is empty. Good. It stays bound for the next game run."
+def _reconcile_other_output(paths, manifest):
+    other = PROFILES_BY_KEY["other_overwrite"]
+    other_root = _output_mod_root(paths, other)
+    if not other_root.is_dir(): return ""
+    messages = []
+    detected = set(_detected_profile_keys(paths))
+    for profile in OUTPUT_PROFILES:
+        if profile.key in {"skse_runtime", "other_overwrite"}: continue
+        if profile.key == "project_legacy" and profile.key not in detected: continue
+        for route in profile.routes:
+            source = other_root / route
+            if not source.is_file() and not _has_files(source): continue
+            target = _output_mod_root(paths, profile) / route
+            count = _move_declared_path(paths, profile, source, target)
+            manifest.note(profile, source, target, "recovered from Other Overwrite Output")
+            messages.append(f"Moved {count} known file(s) out of Other Output: {source} -> {target}")
+    return "\n\n".join(messages)
 def _sync_fw_mods(paths):
     """Keep existing FW output mods in MO2's Output block without creating any."""
-    managed_profiles = [item for item in OUTPUT_PROFILES if (paths.mods / item.mod_name).is_dir()]
+    managed_profiles = [item for item in OUTPUT_PROFILES if _output_mod_root(paths, item).is_dir()]
     for item in managed_profiles:
-        meta = paths.mods / item.mod_name / "meta.ini"
+        meta = _output_mod_root(paths, item) / "meta.ini"
         if not meta.exists():
             meta.write_text("[General]\n"
                             f"gameName={paths.game_name}\nmodid=0\nversion=FileWatchdog\nnewestVersion=\n"
@@ -487,14 +622,14 @@ def _sync_fw_mods(paths):
                             "notes=Do not put normal mod files here.\nconverted=false\nvalidated=false\ntracked=0\n"
                             "\n[installedFiles]\nsize=1\n", encoding="utf-8")
     if not paths.modlist_path.is_file(): return
-    names = {item.mod_name for item in managed_profiles}; all_fw_names = {item.mod_name for item in OUTPUT_PROFILES}
+    names = {_output_mod_name(paths, item) for item in managed_profiles}; all_fw_names = {_output_mod_name(paths, item) for item in OUTPUT_PROFILES}
     lines = paths.modlist_path.read_text(encoding="utf-8").splitlines()
     fw_lines = [line for line in lines if line[:1] in "+-" and line[1:].strip() in names]
     present = {line[1:].strip() for line in fw_lines}
     # New FW output mods start enabled. Existing entries keep the user's exact
     # order and enabled state; this manager doesn't get to rearrange their desk.
-    fw_lines.extend(f"+{item.mod_name}" for item in OUTPUT_PROFILES
-                    if item.mod_name in names and item.mod_name not in present)
+    fw_lines.extend(f"+{_output_mod_name(paths, item)}" for item in OUTPUT_PROFILES
+                    if _output_mod_name(paths, item) in names and _output_mod_name(paths, item) not in present)
     # Empty FW mods get deleted on restore. Their stale modlist entry goes too,
     # otherwise MO2 will keep showing a dead thing like a bad houseplant.
     kept = [line for line in lines if not (line[:1] in "+-" and line[1:].strip() in all_fw_names)]
@@ -620,7 +755,7 @@ def _absorb_skse_children(paths, manifest, root_target):
             child_link = paths.overwrite / route_text
             try: relative = child_link.relative_to(root_link)
             except ValueError: continue
-            child_target = paths.mods / profile.mod_name / route_text; meta = paths.mods / profile.mod_name / "meta.ini"
+            child_target = _output_mod_root(paths, profile) / route_text; meta = _output_mod_root(paths, profile) / "meta.ini"
             try: owned = "FW-owned generated runtime output" in meta.read_text(encoding="utf-8")
             except OSError: owned = False
             if owned and child_target.is_dir():
@@ -671,7 +806,7 @@ def _make_route(paths, manifest, row):
         _check_restore_collision(link, target); _move_tree(link, target); shutil.rmtree(link)
     folded = _absorb_skse_children(paths, manifest, target) if profile.key == "skse_runtime" else ""
     executables = _runtime_executables(profile)
-    _set_output_bindings(paths, executables, profile.mod_name)
+    _set_output_bindings(paths, executables, _output_mod_name(paths, profile))
     manifest.add(profile, link, target, executables)
     routed = f" MO2 now sends {', '.join(executables)} output here." if executables else ""
     return f"Moved out of Overwrite: {link} -> {target}.{routed}" + (f" {folded}" if folded else "")
@@ -695,7 +830,10 @@ def _restore(paths, row, manifest):
         raise RuntimeError(f"Target is not a directory: {row.target}")
     else:
         row.link.mkdir(parents=True, exist_ok=True)
-        _check_restore_collision(row.link, row.target, skipped)
+        duplicates = _check_restore_collision(row.link, row.target, skipped)
+        for relative in duplicates:
+            (row.target / relative).unlink()
+        _prune_empty_dirs(row.target)
         _move_tree(row.target, row.link, skipped)
     if target_was_drained and row.link.is_dir():
         _prune_empty_dirs(row.link)
@@ -703,8 +841,11 @@ def _restore(paths, row, manifest):
     executables = route.executables if route else (_runtime_executables(profile) if profile else ())
     if executables and mod_root: _clear_output_bindings(paths, executables, mod_root.name)
     if route: manifest.remove(row.link)
-    return (f"Released drained route: {row.link}" if target_was_drained
-            else f"Restored to Overwrite: {row.link}")
+    result = (f"Released drained route: {row.link}" if target_was_drained
+              else f"Restored to Overwrite: {row.link}")
+    if not target_was_drained and duplicates:
+        result += f" Removed {len(duplicates)} identical duplicate(s)."
+    return result
 def _fw_mod_root(row):
     profile = PROFILES_BY_KEY.get(row.profile)
     if not profile: return None
@@ -730,7 +871,13 @@ def _remove_empty_fw_mod(paths, row, manifest):
         return " FW mod still has something in it, so it stays put."
 def _unlink_and_remove(paths, row, manifest):
     restored = _restore(paths, row, manifest)
-    return restored + _remove_empty_fw_mod(paths, row, manifest)
+    removed = _remove_empty_fw_mod(paths, row, manifest)
+    pruned = _prune_empty_fw_output_dirs(paths)
+    empty_mods = _prune_empty_fw_mods(paths, manifest)
+    cleanup = []
+    if pruned: cleanup.append(f"Removed {pruned} empty FW folder(s).")
+    if empty_mods: cleanup.append("Removed empty FW mod(s): " + ", ".join(empty_mods) + ".")
+    return " ".join(part for part in (restored + removed, *cleanup) if part)
 def _file_index(root, limit=500):
     """Exact route preview only. Big cache trees get a sane visible cap."""
     result = {}
@@ -746,7 +893,7 @@ def _file_index(root, limit=500):
 
 class FileWatchdogWindow(QDialog):
     HEADERS = ("", "Tool / profile", "Overwrite route", "Target (full path)", "Target type", "Status")
-    def __init__(self, paths, manifest, parent=None, embedded=False, allow_rootdna=True):
+    def __init__(self, paths, manifest, parent=None, embedded=False, allow_rootdna=True, startup_note=""):
         super().__init__(parent); self.paths, self.manifest, self.rows, self.changed, self.status_events = paths, manifest, [], False, []; self._embedded = embedded; self._allow_rootdna = allow_rootdna; self.setWindowTitle("File Watchdog — Route Manager"); self.resize(1450, 840)
         if embedded: self.setWindowFlags(Qt.WindowType.Widget)
         layout = QVBoxLayout(self); tabs = QTabWidget(self); self.tabs = tabs
@@ -793,7 +940,8 @@ class FileWatchdogWindow(QDialog):
             close = QPushButton("Close", self); close.clicked.connect(self.accept); layout.addWidget(close)
         self.refresh()
         self.color_scheme.currentTextChanged.connect(self._apply_color_scheme); self.color_scheme.setCurrentText(self._saved_color_scheme()); self._apply_color_scheme(self.color_scheme.currentText())
-        self._set_status(f"Using MO2 profile: {self.paths.profile_name}\nPath source: {self.paths.path_source}. No path guessing; these are the live paths FW will use.", (self.paths.profile_dir, self.paths.mods, self.paths.overwrite, self.paths.game_root))
+        note = f"\n{startup_note}" if startup_note else ""
+        self._set_status(f"Using MO2 profile: {self.paths.profile_name}\nPath source: {self.paths.path_source}. No path guessing; these are the live paths FW will use.{note}", (self.paths.profile_dir, self.paths.mods, self.paths.overwrite, self.paths.game_root))
 
     def _mount_rootdna(self):
         if self.rootdna_panel is not None or self._rootdna_dir is None: return
@@ -910,9 +1058,14 @@ class FileWatchdogWindow(QDialog):
         try:
             with _fw_mutation(self.paths):
                 for row in selected:
-                    try: messages.append(action(row)); self.changed = True
-                    except Exception as exc: logger.exception("Route action failed: %s", row.link); messages.append(f"Skipped {row.link}: {exc}")
-        except Exception as exc: messages.append(f"Didn't touch anything: {exc}")
+                    try:
+                        message = action(row); messages.append(message); self.changed = True
+                        logger.info("%s", message)
+                    except Exception as exc:
+                        logger.exception("Route action failed: %s", row.link); messages.append(f"Skipped {row.link}: {exc}")
+        except Exception as exc:
+            logger.exception("FW route operation stopped")
+            messages.append(f"Didn't touch anything: {exc}")
         self.refresh(); self._set_status("\n\n".join(messages), [path for row in selected for path in (row.link, row.target)])
     def _set_status(self, message, paths=()):
         # This is a status panel, not a scrapbook. Latest action wins.
@@ -935,7 +1088,10 @@ class FileWatchdogWindow(QDialog):
                         if row.legacy: raise RuntimeError("Legacy routes are recovery-only.")
                         messages.append(_make_route(self.paths, self.manifest, row)); self.changed = True
                     except Exception as exc:
-                        logger.exception("Route action failed: %s", row.link); messages.append(f"Skipped {row.link}: {exc}")
+                        logger.exception(f"Route action failed: {row.link}"); messages.append(f"Skipped {row.link}: {exc}")
+                if _is_skyrim(self.paths):
+                    staging_note = _process_runtime_staging(self.paths, self.manifest)
+                    if staging_note != "Runtime staging is empty. Good. It stays bound for the next game run.": messages.append(staging_note)
                 messages.append("Known route(s) linked. Everything else in Overwrite stayed put; use Clean OW only after you look it over.")
         except Exception as exc:
             logger.exception("Post-create Overwrite cleanup failed"); messages.append(f"FW stopped: {exc}")
@@ -947,17 +1103,17 @@ class FileWatchdogWindow(QDialog):
     def final_cleanup(self):
         try:
             with _fw_mutation(self.paths): message = _final_cleanup(self.paths, self.manifest); self.changed = True
-            self.refresh(); self._set_status(message, (self.paths.overwrite, self.paths.mods / PROFILES_BY_KEY["other_overwrite"].mod_name))
+            self.refresh(); self._set_status(message, (self.paths.overwrite, _output_mod_root(self.paths, PROFILES_BY_KEY["other_overwrite"])))
         except Exception as exc:
             logger.exception("Final Overwrite cleanup failed"); self._set_status(f"Couldn't clean current Overwrite files: {exc}", (self.paths.overwrite,))
     def process_runtime_staging(self):
         try:
             with _fw_mutation(self.paths): message = _process_runtime_staging(self.paths, self.manifest); self.changed = True
             self.refresh()
-            staging = self.paths.mods / PROFILES_BY_KEY["skse_runtime"].mod_name
+            staging = _output_mod_root(self.paths, PROFILES_BY_KEY["skse_runtime"])
             self._set_status(message, (staging, self.paths.overwrite))
         except Exception as exc:
-            logger.exception("Runtime staging cleanup failed"); self._set_status(f"Couldn't process runtime staging: {exc}", (self.paths.mods / PROFILES_BY_KEY["skse_runtime"].mod_name,))
+            logger.exception("Runtime staging cleanup failed"); self._set_status(f"Couldn't process runtime staging: {exc}", (_output_mod_root(self.paths, PROFILES_BY_KEY["skse_runtime"]),))
     def open_selected(self):
         selected = self.selected()
         if len(selected) != 1: self._set_status("Select one target to open. One door at a time."); return
@@ -966,11 +1122,11 @@ class FileWatchdogWindow(QDialog):
 
 class FileWatchdogPlugin(mobase.IPluginTool):
     def __init__(self): super().__init__(); self._organizer: Optional[mobase.IOrganizer] = None
-    def init(self, organizer): self._organizer = organizer; logger.info("File Watchdog booted. No generic-folder shenanigans today."); return True
+    def init(self, organizer): self._organizer = organizer; logger.info(f"File Watchdog 4.2.1 loaded from {Path(__file__).resolve()}"); return True
     def name(self): return "FileWatchdog"
     def author(self): return "SkyGen"
     def description(self): return "Routes known generated output into dedicated File Watchdog mods."
-    def version(self): return mobase.VersionInfo("4.1.3", mobase.VersionScheme.DISCOVER)
+    def version(self): return mobase.VersionInfo("4.2.1", mobase.VersionScheme.DISCOVER)
     def isActive(self): return True
     def settings(self): return []
     def displayName(self): return "File Watchdog"
@@ -982,13 +1138,24 @@ class FileWatchdogPlugin(mobase.IPluginTool):
             if self._organizer is None: raise RuntimeError("MO2 handed FW an empty leash somehow.")
             paths = OrganizerPaths(self._organizer); manifest = RouteManifest(paths.manifest_path, paths.game_identity())
             if manifest.conflict: raise RuntimeError(manifest.conflict)
-            _migrate_runtime_staging_name(paths, manifest); _retire_obsolete_routes(paths, manifest); _prune_drained_overwrite_crumbs(paths, manifest); _prune_empty_fw_mods(paths, manifest); _prune_empty_fw_output_dirs(paths); _sync_fw_mods(paths)
-            window = FileWatchdogWindow(paths, manifest); window.exec()
+            with _fw_mutation(paths):
+                _migrate_runtime_staging_name(paths, manifest)
+                notes = [_update_output_layout(paths, manifest)]
+                recovered_note = _reconcile_other_output(paths, manifest)
+                if recovered_note: notes.append(recovered_note)
+                staging_note = _process_runtime_staging(paths, manifest)
+                if staging_note != "Runtime staging is empty. Good. It stays bound for the next game run.": notes.append(staging_note)
+                cleanup_note = _final_cleanup(paths, manifest)
+                if cleanup_note != "Overwrite is already empty. Cleared its empty folder crumbs too.": notes.append(cleanup_note)
+                startup_note = "\n\n".join(notes)
+                logger.info(startup_note)
+                _retire_obsolete_routes(paths, manifest); _prune_drained_overwrite_crumbs(paths, manifest); _prune_empty_fw_mods(paths, manifest); _prune_empty_fw_output_dirs(paths); _sync_fw_mods(paths)
+            window = FileWatchdogWindow(paths, manifest, startup_note=startup_note); window.exec()
             # RootDNA owns its own filesystem operations, but MO2 still needs
             # the same close-time refresh FW uses for created/removed output
             # mods.  Otherwise a successful RootDNA deploy is invisible in
             # the left pane until the user manually reloads MO2.
             if window.changed or getattr(getattr(window, "rootdna_panel", None), "changed", False): _refresh_mo2(paths)
         except Exception as exc:
-            logger.exception("FW window failed: %s", exc)
+            logger.exception(f"FW window failed: {exc}")
 def createPlugin(): return FileWatchdogPlugin()
