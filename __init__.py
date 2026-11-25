@@ -418,6 +418,12 @@ def _rename_modlist_entry(paths, old_name, new_name):
     lines = paths.modlist_path.read_text(encoding="utf-8").splitlines()
     paths.modlist_path.write_text("\n".join((line[:1] + new_name if line[:1] in "+-" and line[1:].strip() == old_name else line) for line in lines) + "\n", encoding="utf-8")
 
+def _remove_modlist_entry(paths, name):
+    if not paths.modlist_path.is_file(): return
+    lines = paths.modlist_path.read_text(encoding="utf-8").splitlines()
+    kept = [line for line in lines if not (line[:1] in "+-" and line[1:].strip() == name)]
+    if len(kept) != len(lines): paths.modlist_path.write_text("\n".join(kept) + "\n", encoding="utf-8")
+
 def _make_outputs_profile_specific(paths, manifest):
     if _uses_profile_output_names(paths): return "FW output mods already belong to this profile."
     existing = [profile for profile in OUTPUT_PROFILES if (paths.mods / profile.mod_name).is_dir()]
@@ -609,6 +615,63 @@ def _reconcile_other_output(paths, manifest):
             manifest.note(profile, source, target, "recovered from Other Overwrite Output")
             messages.append(f"Moved {count} known file(s) out of Other Output: {source} -> {target}")
     return "\n\n".join(messages)
+
+def _fw_owned(root):
+    try: return "FW-owned generated runtime output" in (root / "meta.ini").read_text(encoding="utf-8")
+    except OSError: return False
+
+def _cleanup_fw_sources(paths):
+    listed = set()
+    try:
+        listed = {line[1:].strip() for line in paths.modlist_path.read_text(encoding="utf-8").splitlines() if line[:1] in "+-"}
+    except OSError: pass
+    current = {_output_mod_name(paths, profile) for profile in OUTPUT_PROFILES}
+    legacy = {profile.mod_name for profile in OUTPUT_PROFILES} | {"FileWatchdog - SKSE Runtime Output"}
+    sources = [root for profile in OUTPUT_PROFILES if (root := _output_mod_root(paths, profile)).is_dir() and _fw_owned(root)]
+    for root in paths.mods.iterdir():
+        if not root.is_dir() or not _fw_owned(root) or root.name in current: continue
+        if root.name in listed or root.name in legacy and not _profiles_using_mod(paths, root.name) - {paths.profile_name}:
+            sources.append(root)
+    return sorted({root.resolve() for root in sources}, key=lambda item: item.name.lower())
+
+def _remove_drained_fw_source(paths, root):
+    try:
+        _prune_empty_dirs(root)
+        meta = root / "meta.ini"
+        if not root.is_dir() or any(item.is_file() and item.name.lower() != "meta.ini" for item in root.rglob("*")): return False
+        if meta.is_file(): meta.unlink()
+        root.rmdir(); _remove_modlist_entry(paths, root.name)
+        return True
+    except OSError: return False
+
+def _cleanup_fw(paths, manifest):
+    sources = _cleanup_fw_sources(paths)
+    if not sources: return "No old FW folders belong to this profile. Nothing to clean."
+    messages = []; moved = 0
+    detected = set(_detected_profile_keys(paths))
+    for source_root in sources:
+        owner = next((profile for profile in OUTPUT_PROFILES if source_root == _output_mod_root(paths, profile)), None)
+        for profile in OUTPUT_PROFILES:
+            if profile.key in {"skse_runtime", "other_overwrite"}: continue
+            if profile.key == "project_legacy" and profile.key not in detected: continue
+            destination_root = _output_mod_root(paths, profile)
+            if source_root == destination_root: continue
+            for route in profile.routes:
+                source, target = source_root / route, destination_root / route
+                if not source.is_file() and not _has_files(source): continue
+                count = _move_declared_path(paths, profile, source, target); moved += count
+                manifest.note(profile, source, target, "consolidated old FW output")
+        leftovers = [item for item in source_root.rglob("*") if item.is_file() and item.name.lower() != "meta.ini"]
+        if leftovers and (owner is None or owner.key == "skse_runtime"):
+            other = PROFILES_BY_KEY["other_overwrite"]; target = _output_mod_root(paths, other)
+            if source_root != target:
+                _prepare_fw_mod(paths, other); _check_restore_collision(target, source_root, ("meta.ini",))
+                _move_tree(source_root, target, ("meta.ini",)); moved += len(leftovers)
+                manifest.note(other, source_root, target, "consolidated old FW leftovers")
+        if _remove_drained_fw_source(paths, source_root): messages.append(f"Removed empty old FW folder: {source_root.name}")
+    _sync_fw_mods(paths)
+    summary = f"Cleanup FW moved {moved} file(s) into this profile's FW outputs."
+    return "\n".join((summary, *messages))
 def _sync_fw_mods(paths):
     """Keep existing FW output mods in MO2's Output block without creating any."""
     managed_profiles = [item for item in OUTPUT_PROFILES if _output_mod_root(paths, item).is_dir()]
@@ -927,6 +990,7 @@ class FileWatchdogWindow(QDialog):
             if text == "Open it": button.setToolTip("Open the selected FW target folder in Explorer.")
             buttons.addWidget(button)
         mop_up = QPushButton("Clean OW", self); mop_up.setToolTip("After a game run: move known FW output to its real home, then put every leftover file in FileWatchdog - Other Overwrite Output."); mop_up.clicked.connect(self.final_cleanup); buttons.addWidget(mop_up)
+        cleanup_fw = QPushButton("Cleanup FW", self); cleanup_fw.setToolTip("Consolidate this profile's old FW output folders into their current homes. Unknown files go to Other Output; other profiles are left alone."); cleanup_fw.clicked.connect(self.cleanup_fw); buttons.addWidget(cleanup_fw)
         if _is_skyrim(self.paths):
             process = QPushButton("Sort staging", self); process.setToolTip("After the game: move staging files into known FW outputs. Anything FW can't place yet goes to Other Output. The empty staging bucket stays bound."); process.clicked.connect(self.process_runtime_staging); buttons.addWidget(process)
         left.addLayout(buttons)
@@ -1106,6 +1170,12 @@ class FileWatchdogWindow(QDialog):
             self.refresh(); self._set_status(message, (self.paths.overwrite, _output_mod_root(self.paths, PROFILES_BY_KEY["other_overwrite"])))
         except Exception as exc:
             logger.exception("Final Overwrite cleanup failed"); self._set_status(f"Couldn't clean current Overwrite files: {exc}", (self.paths.overwrite,))
+    def cleanup_fw(self):
+        try:
+            with _fw_mutation(self.paths): message = _cleanup_fw(self.paths, self.manifest); self.changed = True
+            self.refresh(); self._set_status(message, tuple(_output_mod_root(self.paths, profile) for profile in OUTPUT_PROFILES))
+        except Exception as exc:
+            logger.exception("FW cleanup failed"); self._set_status(f"Cleanup FW stopped: {exc}", (self.paths.mods,))
     def process_runtime_staging(self):
         try:
             with _fw_mutation(self.paths): message = _process_runtime_staging(self.paths, self.manifest); self.changed = True
